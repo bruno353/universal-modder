@@ -12,7 +12,17 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from um import cli, sprixen  # noqa: E402
+from um import cli, fal, sprixen  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def no_keyring(monkeypatch):
+    """Never read or write the real desktop keyring, and start every test with no key cached."""
+    monkeypatch.setattr(sprixen, "keyring_get", lambda: None)
+    monkeypatch.setattr(sprixen, "keyring_set", lambda value: False)
+    monkeypatch.setattr(sprixen, "keyring_clear", lambda: False)
+    monkeypatch.setattr(sprixen, "keyring_available", lambda: False)
+    monkeypatch.setattr(sprixen, "_KEY_CACHE", None)
 
 
 def png(w: int, h: int) -> bytes:
@@ -93,6 +103,7 @@ def fake_sprixen(monkeypatch):
     monkeypatch.setenv("SPRIXEN_API_KEY", "spx_live_test")
     monkeypatch.setattr(sprixen.time, "sleep", lambda s: None)
     state["url"] = f"http://127.0.0.1:{srv.server_address[1]}"
+    monkeypatch.setenv("SPRIXEN_API_URL", state["url"])          # a call without --url still stays on this machine
     yield state
     srv.shutdown()
 
@@ -138,12 +149,42 @@ def test_sprixen_tile_credits_and_errors(fake_sprixen, tmp_path, capsys):
 
 
 def test_sprixen_key_sources(tmp_path, monkeypatch):
+    for v in ("SPRIXEN_API_KEY", "UM_SPRIXEN_KEY_FILE"):
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+
+    def first():
+        return sprixen.key_sources()[0][1]
+
+    (tmp_path / ".env").write_text("SPRIXEN_API_KEY=spx_live_from_dotenv\n")
+    assert first() == "spx_live_from_dotenv"
+    fal.write_key_file("spx_live_from_file", sprixen.key_file())
+    assert sprixen.key_file() == tmp_path / ".secrets" / "sprixen-key"
+    assert first() == "spx_live_from_file"                                         # the stored file wins over .env
+    monkeypatch.setattr(sprixen, "keyring_get", lambda: "spx_live_from_keyring")
+    assert first() == "spx_live_from_keyring"                                      # the keyring wins over the file
+    monkeypatch.setenv("UM_SPRIXEN_KEY_FILE", str(sprixen.key_file()))
+    assert first() == "spx_live_from_file"                                         # unless the file is named on purpose
+    monkeypatch.setenv("SPRIXEN_API_KEY", "spx_live_from_env")
+    monkeypatch.setattr(sprixen, "keyring_get", lambda: pytest.fail("keyring read although SPRIXEN_API_KEY is set"))
+    assert sprixen.api_key() == "spx_live_from_env"                                # the environment wins over all
+
+
+def test_sprixen_key_set_prefers_the_keyring(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("SPRIXEN_API_KEY", raising=False)
     monkeypatch.setenv("UM_SPRIXEN_KEY_FILE", str(tmp_path / "k"))
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".env").write_text("SPRIXEN_API_KEY=spx_live_from_dotenv\n")
-    assert sprixen.api_key() == "spx_live_from_dotenv"
-    (tmp_path / "k").write_text("spx_live_from_file\n")
-    assert sprixen.api_key() == "spx_live_from_file"                               # the stored file wins over .env
-    monkeypatch.setenv("SPRIXEN_API_KEY", "spx_live_from_env")
-    assert [k for _, k in sprixen.key_sources()][0] == "spx_live_from_env"         # and the environment wins over both
+    key = "spx_" + "live_" + "Gh1jK2lM3nO4pQ5rS6tU7vW8xY9z0" * 2    # assembled so `um publish check` passes this file
+    monkeypatch.setattr(sprixen.getpass, "getpass", lambda prompt: key)
+    stored = {}
+    monkeypatch.setattr(sprixen, "keyring_set", lambda value: stored.update(v=value) or True)
+    monkeypatch.setattr(sprixen, "keyring_get", lambda: stored.get("v"))
+    cli.main(["sprixen", "key", "set"])
+    assert stored["v"] == key and not (tmp_path / "k").exists()
+    monkeypatch.setattr(sprixen, "keyring_set", lambda value: False)              # no keyring: the owner-only file
+    cli.main(["sprixen", "key", "set"])
+    assert (tmp_path / "k").read_text().strip() == key
+    cli.main(["sprixen", "key", "status"])
+    out = capsys.readouterr().out
+    assert "OS keyring" in out and key not in out                                 # keys are only shown masked

@@ -11,16 +11,17 @@
 
 Style lives in a Sprixen project (art style, resolution, view angle, palette), so every sprite generated in
 the same project shares one look. `sprite` reuses the project named by --project, or one named after the
-style flags ("um pixel_art side_scroll"), and creates it on first use. Sprites come back with a real
-transparent background (ML background removal, never a colour key) and print their sprite id: pass it to
-`animate`, which returns one horizontal strip of frames (frame size = sheet width / frames x sheet height;
-`um sprite slice` splits it, `um sprite sheet --vertical` restacks it for Terraria-style NPCs).
+style flags ("um pixel_art side_scroll"), and creates it on first use. Sprites come back on a transparent
+background and print their sprite id: pass it to `animate`, which returns one horizontal strip of frames
+(frame size = sheet width / frames x sheet height; `um sprite slice` splits it, `um sprite sheet --vertical`
+restacks it for Terraria-style NPCs).
 
-Get a key at https://sprixen.com/settings/api. It is read from SPRIXEN_API_KEY, else from the file
-`um sprixen key set` wrote (UM_SPRIXEN_KEY_FILE, default ~/.secrets/sprixen-key, owner-only), else from
-SPRIXEN_API_KEY=... in a .env. Generation costs credits (sprite 2 per variant, animation 4, premium 8,
-tile 1); `um sprixen credits` shows what is left. Files land in --out (default assets/gen), and each call
-appends a line to <out>/sprixen_manifest.jsonl (ids, prompt, settings, files) so an asset can be traced.
+Sprixen is a paid service: it needs an account, an API key (https://sprixen.com/settings/api) and credits
+(sprite 2 per variant, animation 4, premium 8, tile 1); `um sprixen credits` shows what is left. The key is
+read from SPRIXEN_API_KEY, else from where `um sprixen key set` stored it (the desktop keyring on Linux, an
+owner-only ~/.secrets/sprixen-key elsewhere), else from SPRIXEN_API_KEY=... in a .env.
+Files land in --out (default assets/gen), and each call appends a line to <out>/sprixen_manifest.jsonl (ids,
+prompt, settings, files) so an asset can be traced.
 """
 from __future__ import annotations
 
@@ -44,6 +45,8 @@ SIZES = ["16x16", "32x32", "64x64", "128x128", "256x256", "512x512"]
 ANIMATIONS = ["idle", "walk", "run", "attack", "jump", "death", "hurt", "custom"]
 DIRECTIONS = ["right", "left", "up", "down", "up-right", "up-left", "down-right", "down-left"]
 _DEFAULT_KEY_FILE = "~/.secrets/sprixen-key"
+KEYRING_ATTRS = ["service", "sprixen.com", "key", "api"]
+_KEY_CACHE: str | None = None
 
 
 # --------------------------------------------------------------------------- key
@@ -61,29 +64,59 @@ def _read_dotenv(p: Path) -> str | None:
     return m.group(1) if m else None
 
 
+def keyring_available() -> bool:
+    from um.fal import keyring_available
+    return keyring_available()
+
+
+def keyring_get() -> str | None:
+    """The key in the desktop keyring (libsecret's secret-tool, the same route as `um fal key`), or None."""
+    from um.fal import _secret_tool
+    r = _secret_tool("lookup", *KEYRING_ATTRS)
+    return (r.stdout.strip() or None) if r and r.returncode == 0 else None
+
+
+def keyring_set(value: str) -> bool:
+    from um.fal import _secret_tool
+    r = _secret_tool("store", "--label", "Sprixen API key (universal-modder)", *KEYRING_ATTRS, value=value)
+    return bool(r and r.returncode == 0)
+
+
+def keyring_clear() -> bool:
+    from um.fal import _secret_tool
+    r = _secret_tool("clear", *KEYRING_ATTRS)
+    return bool(r and r.returncode == 0)
+
+
+def _key_candidates():
+    """(label, reader) in precedence order. Nothing is read until its reader is called, so a SPRIXEN_API_KEY in
+    the environment never touches the keyring."""
+    from um.fal import _read_file
+    named, kf = os.environ.get("UM_SPRIXEN_KEY_FILE"), key_file()
+    yield "SPRIXEN_API_KEY environment variable", lambda: (os.environ.get("SPRIXEN_API_KEY") or "").strip() or None
+    if named:                                                 # a file named on purpose comes before the keyring
+        yield f"key file {kf} (UM_SPRIXEN_KEY_FILE)", lambda: _read_file(kf)
+    yield f"OS keyring ({' '.join(KEYRING_ATTRS)})", keyring_get
+    if not named:
+        yield f"key file {kf}", lambda: _read_file(kf)
+    for p in dict.fromkeys((Path.cwd() / ".env", Path(__file__).resolve().parents[1] / ".env")):
+        yield f".env {p}", lambda p=p: _read_dotenv(p)
+
+
 def key_sources() -> list[tuple[str, str]]:
     """(label, key) for every source that has a key, in precedence order: the first one is used."""
-    from um.fal import _read_file
-    found = []
-    env = (os.environ.get("SPRIXEN_API_KEY") or "").strip()
-    if env:
-        found.append(("SPRIXEN_API_KEY environment variable", env))
-    kf = _read_file(key_file())
-    if kf:
-        found.append((f"key file {key_file()}", kf))
-    for p in dict.fromkeys((Path.cwd() / ".env", Path(__file__).resolve().parents[1] / ".env")):
-        k = _read_dotenv(p)
-        if k:
-            found.append((f".env {p}", k))
-    return found
+    return [(label, k) for label, read in _key_candidates() if (k := read())]
 
 
 def api_key() -> str:
-    sources = key_sources()
-    if not sources:
+    """The first key found, read once per run (a poll loop would otherwise ask the keyring every few seconds)."""
+    global _KEY_CACHE
+    if not _KEY_CACHE:
+        _KEY_CACHE = next((k for _, read in _key_candidates() if (k := read())), None)
+    if not _KEY_CACHE:
         die("no Sprixen key. Create one at https://sprixen.com/settings/api, then `um sprixen key set` "
             "(or set SPRIXEN_API_KEY)")
-    return sources[0][1]
+    return _KEY_CACHE
 
 
 def cmd_key(a):
@@ -94,16 +127,27 @@ def cmd_key(a):
             die("empty key, nothing stored")
         if not value.startswith("spx_"):
             print("note: Sprixen keys start with spx_live_; storing it anyway", file=sys.stderr)
-        print(f"stored in {write_key_file(value, key_file())} as {mask(value)} (plaintext, owner-only)")
+        if getattr(a, "file_only", False):
+            print(f"stored in {write_key_file(value, key_file())} as {mask(value)} (plaintext, owner-only)")
+        elif keyring_set(value) and keyring_get() == value:
+            print(f"stored in the OS keyring as {mask(value)} ({' '.join(KEYRING_ATTRS)})")
+        elif keyring_available():
+            die("could not write to the OS keyring (is it unlocked?); "
+                "`um sprixen key set --file-only` stores the key in a plaintext file instead")
+        else:
+            print(f"no OS keyring (no secret-tool); stored in {write_key_file(value, key_file())} as {mask(value)} "
+                  "(plaintext, owner-only)")
         if os.environ.get("SPRIXEN_API_KEY"):
             print("note: SPRIXEN_API_KEY is set in this environment and takes precedence over the stored key")
     elif a.action == "clear":
+        removed = []
+        if keyring_get() and keyring_clear():
+            removed.append("OS keyring")
         kf = key_file()
         if kf.exists():
             kf.unlink()
-            print(f"deleted {kf}")
-        else:
-            print(f"no key file at {kf}")
+            removed.append(str(kf))
+        print("removed: " + ", ".join(removed) if removed else "nothing to remove")
     else:
         sources = key_sources()
         if not sources:
@@ -111,6 +155,7 @@ def cmd_key(a):
         for i, (label, k) in enumerate(sources):
             print(f"{'active  ' if i == 0 else 'shadowed'}  {label}  ->  {mask(k)}")
         kf = key_file()
+        print(f"keyring     {'available' if keyring_available() else 'not available (no secret-tool)'}")
         print(f"key file    {kf} {'exists (mode ' + file_mode(kf) + ')' if kf.exists() else 'absent'}")
 
 
@@ -146,7 +191,9 @@ def request(base: str, method: str, path: str, body: dict | None = None, retries
         try:
             with urllib.request.urlopen(req, timeout=120) as r:
                 payload = r.read()
-                return json.loads(payload) if payload else {}
+            return json.loads(payload) if payload else {}
+        except ValueError:
+            die(f"Sprixen {method} {path} answered with something that isn't JSON")
         except urllib.error.HTTPError as e:
             line, err = _error(e.code, e.read())
             wait = ((err.get("hint") or {}).get("details") or {}).get("retryAfterSeconds")
@@ -158,6 +205,8 @@ def request(base: str, method: str, path: str, body: dict | None = None, retries
             die(f"Sprixen {method} {path} -> {line}")
         except urllib.error.URLError as e:
             die(f"no Sprixen API at {base} ({e.reason})")
+        except OSError as e:                                  # a timeout or reset while reading the answer
+            die(f"Sprixen {method} {path} failed: {e or type(e).__name__}")
 
 
 def download(base: str, url: str, path: Path) -> Path:
@@ -167,8 +216,8 @@ def download(base: str, url: str, path: Path) -> Path:
     try:
         with urllib.request.urlopen(req, timeout=300) as r:
             path.write_bytes(r.read())
-    except urllib.error.URLError as e:
-        die(f"could not download {full}: {getattr(e, 'reason', e)}")
+    except OSError as e:                                      # URLError, HTTPError, or a timeout while reading
+        die(f"could not download {full}: {getattr(e, 'reason', None) or e or type(e).__name__}")
     return path
 
 
@@ -386,15 +435,18 @@ def register(sub):
     q.add_argument("--category", default="terrain", choices=["terrain", "decoration", "entity"])
     q.add_argument("--flat", action="store_true", help="isometric only: a flat tile without raised block sides")
 
-    kp = cs.add_parser("key", help="store / inspect the Sprixen API key",
-                       description="`um sprixen` takes the key from SPRIXEN_API_KEY first, then from the file "
-                                   "`um sprixen key set` writes (UM_SPRIXEN_KEY_FILE, default ~/.secrets/sprixen-key, "
-                                   "owner-only), then from SPRIXEN_API_KEY=... in a .env. Keys are never printed in full.")
+    kp = cs.add_parser("key", help="store / inspect the Sprixen API key (OS keyring first)",
+                       description="`um sprixen` takes the key from SPRIXEN_API_KEY first, then from a file named by "
+                                   "UM_SPRIXEN_KEY_FILE, then from the OS keyring (libsecret's secret-tool, as `um fal "
+                                   "key` uses: Linux), then from ~/.secrets/sprixen-key (owner-only, what `um sprixen "
+                                   "key set` writes where there's no keyring), then from SPRIXEN_API_KEY=... in a .env. "
+                                   "Keys are never printed in full.")
     ka = kp.add_subparsers(dest="action", metavar="<action>")
     ks = ka.add_parser("set", help="store a key from a hidden prompt (or --from-file)")
     ks.add_argument("--from-file", metavar="PATH")
+    ks.add_argument("--file-only", action="store_true", help="skip the OS keyring; write the owner-only key file")
     ka.add_parser("status", help="show every source and which one is active (keys are masked)")
-    ka.add_parser("clear", help="delete the stored key file")
+    ka.add_parser("clear", help="delete the stored key (keyring entry and key file)")
     kp.set_defaults(func=main, cmd="key", action="status")
     for _a in ka.choices.values():
         _a.set_defaults(func=main, cmd="key")
